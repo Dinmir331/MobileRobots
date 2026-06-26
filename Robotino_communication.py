@@ -1,71 +1,82 @@
-# Importing necessary libraries
+# ================================================================
+#  МОДУЛЬ СВЯЗИ С ROBOTINO (Robotino_communication.py)
+# ================================================================
+
 import socket
 import requests
-# Robotino's connection info
-IP_ADDRESS = '192.168.0.1'  # Local Robotino IP address
-PORT = 80  # Port to connect to
+import time                     # добавлено: необходим для работы send_velocity
 
-# Connect to Robotino
+# Параметры подключения к роботу
+IP_ADDRESS = '192.168.0.1'      # локальный IP‑адрес робота
+PORT = 80                       # порт для HTTP‑запросов
+
+# Глобальная переменная для подавления частых сообщений об ошибках
+_last_error_time = 0.0
+
+# ------------------------------------------------------------------
 def connect_to_robotino():
+    """Устанавливает TCP‑соединение с роботом (необязательно для HTTP)."""
     try:
-        # Create a TCP/IP socket
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect((IP_ADDRESS, PORT))
-        print("Successfully connected to Robotino!")
+        print("Успешно подключились к Robotino!")
         return sock
     except Exception as e:
-        print(f"Error connecting to Robotino: {e}")
+        print(f"Ошибка подключения к Robotino: {e}")
         return None
-# Get raw odometry from robotino
+
+# ------------------------------------------------------------------
 def get_odometry():
+    """Запрашивает одометрию робота. Возвращает список [x, y, phi, ...] или None."""
     try:
-        # Send HTTP GET request to retrieve proximity sensor values
         url = f"http://{IP_ADDRESS}/data/odometry"
-        response = requests.get(url)
-        # Check if the response is successful
+        response = requests.get(url, timeout=0.2)
         if response.status_code == 200:
-            # Assuming the response returns an array of floats in a JSON format
-            odometry_readings = response.json()  # Parse JSON response
+            odometry_readings = response.json()
             if len(odometry_readings) == 7:
+                # [0] – X, [1] – Y, [2] – угол PHI
                 return odometry_readings
             else:
-                print("Unexpected number of sensor values received.")
+                print("Получено неожиданное количество значений датчиков.")
         else:
-            print(f"Error: Received status code {response.status_code}")
+            print(f"Ошибка: получен код состояния {response.status_code}")
     except Exception as e:
-        print(f"Error retrieving sensor values: {e}")
+        print(f"Ошибка получения одометрии: {e}")
     return None
 
-# Get the proximity sensors' values from robotino
+# ------------------------------------------------------------------
 def get_proximity_sensor_values():
+    """Запрашивает данные датчиков расстояния. Возвращает список из 9 значений или None."""
     try:
-        # Send HTTP GET request to retrieve proximity sensor values
         url = f"http://{IP_ADDRESS}/data/distancesensorarray"
-        response = requests.get(url)
-        # Check if the response is successful
+        response = requests.get(url, timeout=0.2)
         if response.status_code == 200:
-            # Assuming the response returns an array of floats in a JSON format
-            sensor_values = response.json()  # Parse JSON response
+            sensor_values = response.json()
             if len(sensor_values) == 9:
                 return sensor_values
             else:
-                print("Unexpected number of sensor values received.")
+                print("Получено неожиданное количество значений датчиков.")
         else:
-            print(f"Error: Received status code {response.status_code}")
+            print(f"Ошибка: получен код состояния {response.status_code}")
     except Exception as e:
-        print(f"Error retrieving sensor values: {e}")
+        print(f"Ошибка получения данных с датчиков: {e}")
     return None
 
-# Sending commands to Robotino
+# ------------------------------------------------------------------
 def send_velocity(vx, vy, omega):
+    """Отправляет команду скоростей роботу (всенаправленное движение)."""
+    global _last_error_time
     url = f"http://{IP_ADDRESS}/data/omnidrive"
-    data = [vx, vy, omega]  # Prepare the data as a list
+    # Преобразуем в обычный float для сериализации JSON
+    data = [float(vx), float(vy), float(omega)]
     try:
-        # Send the velocity data to Robotino
-        response = requests.post(url, json=data)  # Send data as JSON
+        response = requests.post(url, json=data, timeout=0.2)
         if response.status_code == 200:
-            print(f"Sent Vx: {vx}, Vy: {vy}")
+            pass   # команда успешно принята
         else:
-            print(f"Failed to send data: {response.status_code} - {response.text}")
+            print(f"Ошибка отправки данных: {response.status_code} - {response.text}")
     except Exception as e:
-        print(f"Error sending data: {e}")
+        # Выводим сообщение не чаще одного раза в секунду
+        if time.time() - _last_error_time > 1.0:
+            print(f"Ошибка отправки данных: {e}")
+            _last_error_time = time.time()

@@ -1,264 +1,1245 @@
-#!/usr/bin/env python3
-"""
-Ручное управление Robotino мышью с видом сверху.
-Поддерживает два источника видео:
-  - веб-камера (числовой индекс, например 0)
-  - видеофайл (строка пути к файлу)
-- Настройка рамки поля (выделение ROI + реальные размеры)
-- Визуализация текущих координат робота (из одометрии)
-- Отображение пройденного маршрута
-- Управление кликом мыши: робот едет в указанную точку
-- Дополнительно: на роботе может быть закреплён маркер, для рисования траектории
-  на реальном поле (управление подъёмом/опусканием маркера не реализовано,
-  но может быть добавлено через API Robotino).
-"""
-
+# ================================================================
+#  РАЗДЕЛ 1: ИМПОРТЫ И НАСТРОЙКИ
+# ================================================================
+# Библиотеки и функции
 import cv2
 import numpy as np
-import requests
 import time
-import threading
-import sys
+import math
+
 from collections import deque
+from Robotino_communication import send_velocity, get_odometry
+import json
+import os
 
-# ========== НАСТРОЙКИ ==========
-ROBOTINO_IP = "192.168.0.1"          # IP робота
-# ИСТОЧНИК ВИДЕО: число -> индекс камеры, строка -> путь к файлу
-VIDEO_SOURCE = 0                     # или "video.mp4"
-MAX_SPEED = 0.2                      # максимальная линейная скорость, м/с
-KP = 0.8                             # коэффициент пропорционального регулятора
-DIST_THRESHOLD = 0.03                # порог достижения цели, м
-ODOMETRY_RATE = 10                   # частота опроса одометрии, Гц
-# ================================
+import matplotlib.pyplot as plt
+import datetime
 
-# Глобальные переменные для одометрии
-robot_lock = threading.Lock()
-robot_x, robot_y, robot_phi = 0.0, 0.0, 0.0
-robot_odom_valid = False
+# Режимы работы
+USE_CAMERA = True               # True - камера, False - видеофайл video.mp4
+CONTROL = True                  # True - управление роботом, False - только видео-поток
+OBSTACLE_MODE = "static"        # "static" - препятствия по первому кадру после калибровки, "dynamic" - обновлять постоянно
+PATH_ALGORITHM = "A*"            # Алгоритм построения пути: "A*", "Dijkstra", "Greedy", "Bidirectional"
 
-# Целевая точка (в мировых координатах) и флаг активности
-target_world = None
-target_lock = threading.Lock()
+# SPLINE
+PATH_SMOOTHING = True           # True - сглаживать путь сплайнами, False - без сглаживания
+SPLINE_RESOLUTION = 0.05        # расстояние между точками сглаженного пути в метрах (чем меньше, тем плавнее)
+SIMPLIFY_EPSILON_PX = 15       # допустимое отклонение в пикселях при упрощении (0 — без упрощения)
 
-# История траектории (мировые координаты)
-trajectory = deque(maxlen=1000)
+LOG_DIR = "trajectory_logs"    # папка для сохранения графиков
+goal_just_reached = False        # флаг, что цель только что задана и ждёт сохранения
 
-# Параметры калибровки ROI
-roi = None          # (x, y, w, h) в пикселях
-real_width = None   # метры
-real_height = None  # метры
+# Видео-поток и передача информации
+CAMERA_INDEX = 0                # индекс камеры или путь к видеофайлу
+VIDEO_NAME = "video_4.mp4"      # название файла видео
+LOOP_VIDEO = False              # зацикливать видеофайл при окончании
+SEND_INTERVAL = 0.05             # секунды, минимальный интервал отправки команд
+PIX_PER_METER = 400             # Масштаб: сколько пикселей в одном метре на выходном изображении
+OBSTACLE_PROCESS_SCALE = 5      # во сколько раз уменьшать изображение для обработки препятствий (ускоряет расчёт)
 
-def get_odometry():
-    """Получить одометрию от Robotino, возвращает [x, y, phi, vx, vy, omega, seq] или None."""
+trajectory_world = deque(maxlen=1000)  # очередь пройденных позиций
+trajectory_time = deque(maxlen=1000)   # метки времени для каждой позиции
+
+# распознавание цветов на картинке // ЦВЕТОВЫЕ ДИАПАЗОНЫ ПРЕПЯТСТВИЙ (HSV)
+# Каждый диапазон: (H_low, S_low, V_low, H_high, S_high, V_high)
+# H от 0 до 179, S и V от 0 до 255
+OBSTACLE_COLORS = [
+    (0, 0, 0, 120, 255, 150), # Чёрный (низкая яркость) V > 30 - серый
+    (0, 50, 50, 10, 255, 255), # Красный (1 диапазон)
+    (160, 50, 50, 180, 255, 255), # Красный (2 диапазон)
+    (40, 50, 50, 80, 255, 255), # Зелёный
+    (100, 50, 50, 130, 255, 255) # Синий
+]
+# Морфология для очистки маски
+MORPH_OPEN_KERNEL_SIZE = 5        # размер ядра открытия (убрать шум)
+MORPH_CLOSE_KERNEL_SIZE = 13      # размер ядра закрытия (заполнить дыры)
+
+# распознавание препятствий
+MIN_OBSTACLE_AREA_PX = 150      # минимальная площадь препятствия в пикселях (меньше — игнорируем)
+OBSTACLE_MERGE_DIST_PX = 1      # расстояние в пикселях для слияния близких препятствий
+PROCESS_EVERY_N_FRAMES = 5      # обрабатывать препятствия каждый N-й кадр (1 — каждый)
+BORDER_MARGIN_M = 0.15           # отступ от края поля в метрах
+OBSTACLE_SAFE_RADIUS_M = 0.33    # безопасный радиус вокруг препятствий в метрах (не меняется при масштабе)
+PLANNING_EXTRA_RADIUS_M = 0.02   # дополнительный отступ при построении маршрута (метры)
+
+# Габариты робота и поля
+ROBOT_DIAMETER_M = 0.53      # диаметр робота в метрах (для исключения из препятствий)
+FIELD_WIDTH = 2.2               # метры, реальная ширина поля
+FIELD_HEIGHT = 2.2              # метры, реальная высота поля
+
+# Движение и скорость робота
+MAX_SPEED = 0.1                 # м/с, максимальная линейная скорость
+GOAL_TOLERANCE = 0.1           # метры, радиус достижения целевой траектории
+WP_THRESHOLD_M = 0.1           # м до waypoint'а — переключаемся на следующий
+
+# ================================================================
+#  РАЗДЕЛ 2: ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ СОСТОЯНИЯ
+# ================================================================
+
+# Точки границ поля
+calib_points = []               # список 4 углов поля в пикселях
+M = None                        # матрица гомографии (пиксели -> мировые метры)
+
+# Траектори
+target_world = None             # целевая точка в мировых координатах (x, y)
+trajectory_world = deque(maxlen=1000)  # очередь пройденных позиций
+robot_pos = None                # (x_world, y_world, angle_rad)
+planned_path = []               # список пиксельных точек пути (в полном разрешении)
+goal_prev = None                # предыдущая цель для отслеживания смены
+waypoint_index = 0              # текущий индекс waypoint в planned_path
+last_wp_index = 0               # индекс последней выбранной waypoint'ы
+last_send_time = 0              # Время
+
+# Картинка
+warp_window_initialized = False
+frame_count = 0
+last_binary_obs = None          # хранит последнюю рассчитанную маску препятствий
+static_binary_mask = None       # маска для статического режима
+plot_saved = False              # флаг, что график для текущей цели уже сохранён
+initial_planned_path = []        # сохраняет первый план для текущей цели
+
+# Одометрия
+odom_text = ""                  # строка с данными одометрии для отображения
+current_vx_world = 0.0          # текущая мировая скорость X (вниз)
+current_vy_world = 0.0          # текущая мировая скорость Y (вправо)
+last_odom_time = 0              # одометрия
+
+# ================================================================
+#  РАЗДЕЛ 3: ИНИЦИАЛИЗАЦИЯ ARUCO ДЕТЕКТОРА
+# ================================================================
+MARKER_ID = 9                         # ID ArUco маркера
+ARUCO_DICT = cv2.aruco.DICT_6X6_250
+
+aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT)
+aruco_params = cv2.aruco.DetectorParameters()
+# Настройки для более стабильного распознавания
+aruco_params.adaptiveThreshWinSizeMin = 3
+aruco_params.adaptiveThreshWinSizeMax = 23
+aruco_params.adaptiveThreshWinSizeStep = 10
+aruco_params.adaptiveThreshConstant = 7
+aruco_params.minMarkerPerimeterRate = 0.03
+aruco_params.maxMarkerPerimeterRate = 4.0
+aruco_params.polygonalApproxAccuracyRate = 0.03
+aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+
+# ================================================================
+#  РАЗДЕЛ 4: ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ================================================================
+
+##########################
+# Сохранение точек калиббровки поля по камере
+CALIB_FILE = "field_calibration.json"
+
+def save_calibration():
+    """Сохраняет calib_points в JSON-файл."""
     try:
-        url = f"http://{ROBOTINO_IP}/data/odometry"
-        resp = requests.get(url, timeout=0.2)
-        if resp.status_code == 200:
-            data = resp.json()
-            if len(data) == 7:
-                return data
-    except Exception:
+        with open(CALIB_FILE, 'w') as f:
+            json.dump(calib_points, f)
+        print("Калибровочные точки сохранены.")
+    except Exception as e:
+        print(f"Ошибка сохранения калибровки: {e}")
+
+def load_calibration():
+    """Загружает точки из файла и вычисляет M. Возвращает True при успехе."""
+    global M, calib_points
+    if not os.path.exists(CALIB_FILE):
+        return False
+    try:
+        with open(CALIB_FILE, 'r') as f:
+            pts = json.load(f)
+        if len(pts) != 4:
+            return False
+        calib_points = [tuple(p) for p in pts]  # список кортежей (x,y)
+        # Вычисляем гомографию
+        ww = int(FIELD_WIDTH * PIX_PER_METER)
+        wh = int(FIELD_HEIGHT * PIX_PER_METER)
+        dst_corners = np.array([[0, 0], [ww, 0], [ww, wh], [0, wh]], dtype=np.float32)
+        src_corners = np.array(calib_points, dtype=np.float32)
+        M, _ = cv2.findHomography(src_corners, dst_corners)
+        if M is not None:
+            print("Калибровка загружена из файла.")
+            return True
+        else:
+            calib_points = []
+            return False
+    except Exception as e:
+        print(f"Ошибка загрузки калибровки: {e}")
+        return False
+
+##########################
+# Безопасная отправка скоростей (подавление всех исключений)
+def safe_send(vx, vy, omega):
+    try:
+        send_velocity(float(vx), float(vy), float(omega))
+    except:
         pass
+
+# Обработчик мыши
+def mouse_callback(event, x, y, flags, param):
+    global calib_points, target_world, M
+    if event == cv2.EVENT_LBUTTONDOWN:
+        if M is None and len(calib_points) < 4:
+            calib_points.append((x, y))
+            if len(calib_points) == 4:
+                ww = int(FIELD_WIDTH * PIX_PER_METER)
+                wh = int(FIELD_HEIGHT * PIX_PER_METER)
+                dst_corners = np.array([[0, 0], [ww, 0], [ww, wh], [0, wh]], dtype=np.float32)
+                src_corners = np.array(calib_points, dtype=np.float32)
+                M, _ = cv2.findHomography(src_corners, dst_corners)
+                if M is None:
+                    calib_points = []
+                    static_binary_mask = None
+                else:
+                    # Успешная калибровка → сохраняем
+                    save_calibration()
+        elif M is not None:
+            # Клик по warped-изображению: X пикселя -> мировая Y (вправо), Y пикселя -> мировая X (вниз)
+            target_world = (y / PIX_PER_METER, x / PIX_PER_METER)
+            goal_just_reached = True          # новая цель → при достижении сохраним
+            trajectory_world.clear()          # очищаем старую траекторию
+            trajectory_time.clear()
+            initial_planned_path = []
+            plot_saved = False
+
+# Детекция робота по ArUco маркеру
+def detect_robot(frame):
+    detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
+    corners, ids, _ = detector.detectMarkers(frame)
+    if ids is not None and MARKER_ID in ids.flatten():
+        idx = np.where(ids.flatten() == MARKER_ID)[0][0]
+        corner = corners[idx][0]
+        center = np.mean(corner, axis=0)
+        vec = corner[1] - corner[0]
+        angle = math.atan2(vec[1], vec[0])
+        # Преобразуем угол в мировую систему: X вниз, Y вправо
+        phi = - angle
+        return center[0], center[1], phi, corner   # возвращаем phi
     return None
 
-def send_velocity(vx, vy, omega):
-    """Отправить команду скоростей роботу."""
-    try:
-        url = f"http://{ROBOTINO_IP}/data/omnidrive"
-        requests.post(url, json=[vx, vy, omega], timeout=0.2)
-    except Exception:
-        pass
+# ================================================================
+#  РАЗДЕЛ 5: ФУНКЦИИ ОТРИСОВКИ
+# ================================================================
 
-def odometry_thread():
-    """Фоновый поток для непрерывного получения одометрии."""
-    global robot_x, robot_y, robot_phi, robot_odom_valid
-    while True:
-        data = get_odometry()
-        if data is not None:
-            with robot_lock:
-                robot_x, robot_y, robot_phi = data[0], data[1], data[2]
-                robot_odom_valid = True
-        time.sleep(1.0 / ODOMETRY_RATE)
+def draw_calibration_points(frame):
+    for pt in calib_points:
+        cv2.circle(frame, pt, 5, (0, 0, 0), -1)   # чёрный цвет
 
-def pixel_to_world(px, py):
-    """Преобразование координат пикселя в мировые (метры) на основе ROI."""
-    if roi is None or real_width is None or real_height is None:
+def draw_field(frame):
+    if len(calib_points) == 4:
+        pts = np.array(calib_points, np.int32).reshape((-1, 1, 2))
+        cv2.polylines(frame, [pts], isClosed=True, color=(0, 255, 0), thickness=1)
+
+def draw_trajectory(frame):
+    if M is None or len(trajectory_world) < 2:
+        return
+    # Мировые координаты (x, y): x вниз, y вправо
+    # Пиксель X = мировая Y * PIX_PER_METER, Пиксель Y = мировая X * PIX_PER_METER
+    pts = [(int(p[1] * PIX_PER_METER), int(p[0] * PIX_PER_METER)) for p in trajectory_world]
+    for i in range(1, len(pts)):
+        cv2.line(frame, pts[i-1], pts[i], (0, 140, 255), 2)   # оранжевый
+
+def draw_status_info(frame, robot_pos, target_world, vx_w, vy_w):
+    """Выводит информацию о скоростях и позиции в правом верхнем углу кадра."""
+    if robot_pos is None:
+        return
+    h, w = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    thickness = 1
+    color = (0, 0, 0)  # чёрный текст
+
+    # Собираем строки
+    lines = []
+    sp = math.hypot(vx_w, vy_w)
+    lines.append(f"Speed: {sp:.2f} m/s")
+    lines.append(f"Vx: {vx_w:.2f}  Vy: {vy_w:.2f}")
+    if robot_pos is not None:
+        rx, ry, _ = robot_pos
+        lines.append(f"Pos R: ({rx:.2f}, {ry:.2f})")
+    else:
+        lines.append("Pos R: ---")
+    if target_world is not None:
+        gx, gy = target_world
+        lines.append(f"Goal: ({gx:.2f}, {gy:.2f})")
+    else:
+        lines.append("Goal: ---")
+
+    # Вычисляем максимальную ширину текста для выравнивания по правому краю
+    max_width = 0
+    for line in lines:
+        size = cv2.getTextSize(line, font, font_scale, thickness)[0]
+        max_width = max(max_width, size[0])
+    x_start = w - max_width - 10   # отступ 10 пикселей от правого края
+
+    y = 30
+    for line in lines:
+        cv2.putText(frame, line, (x_start, y), font, font_scale, color, thickness)
+        y += 20
+# ================================================================
+#  РАЗДЕЛ 6: ФУНКЦИИ ОБРАБОТКИ ПРЕПЯТСТВИЙ
+# ================================================================
+
+def simplify_obstacle_mask(binary_mask, merge_dist_px):
+    contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return np.zeros_like(binary_mask)
+
+    # Фильтруем по минимальной площади + выпуклая оболочка
+    hulls = [cv2.convexHull(cnt) for cnt in contours if cv2.contourArea(cnt) >= MIN_OBSTACLE_AREA_PX]
+    if not hulls:
+        return np.zeros_like(binary_mask)
+
+    temp = np.zeros_like(binary_mask)
+    cv2.drawContours(temp, hulls, -1, 255, cv2.FILLED)
+
+    # Слияние близких оболочек
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                       (merge_dist_px * 2 + 1, merge_dist_px * 2 + 1))
+    merged = cv2.dilate(temp, kernel, iterations=1)
+
+    merged_contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    simplified = np.zeros_like(binary_mask)
+    # Финальные оболочки тоже фильтруем по площади
+    final_hulls = [cv2.convexHull(cnt) for cnt in merged_contours if cv2.contourArea(cnt) >= MIN_OBSTACLE_AREA_PX]
+    cv2.drawContours(simplified, final_hulls, -1, 255, cv2.FILLED)
+    return simplified
+
+def detect_obstacles(warped_frame, robot_pix=None, marker_corners=None, scale=1):
+    """
+    Создаёт бинарную маску препятствий на основе заданных цветовых диапазонов.
+    Возвращает маску того же размера, что и warped_frame.
+    """
+    h_full, w_full = warped_frame.shape[:2]
+    # Работаем на уменьшенном изображении для скорости
+    if scale > 1:
+        small_h, small_w = int(h_full / scale), int(w_full / scale)
+        clean = cv2.resize(warped_frame, (small_w, small_h), interpolation=cv2.INTER_AREA)
+        if robot_pix is not None:
+            rx_small = int(robot_pix[0] / scale)
+            ry_small = int(robot_pix[1] / scale)
+            robot_pix_small = (rx_small, ry_small)
+        else:
+            robot_pix_small = None
+        if marker_corners is not None:
+            marker_corners_small = [(int(x/scale), int(y/scale)) for (x, y) in marker_corners]
+        else:
+            marker_corners_small = None
+    else:
+        clean = warped_frame.copy()
+        robot_pix_small = robot_pix
+        marker_corners_small = marker_corners
+
+    # Исключаем маркер и корпус робота
+    if marker_corners_small is not None:
+        pts = np.array(marker_corners_small, dtype=np.int32)
+        cv2.fillPoly(clean, [pts], (255, 255, 255))
+    if robot_pix_small is not None:
+        rx, ry = robot_pix_small
+        radius_px = int((ROBOT_DIAMETER_M / 2) * PIX_PER_METER / scale)
+        cv2.circle(clean, (rx, ry), radius_px, (255, 255, 255), -1)
+
+    # Переводим в HSV для цветовой фильтрации
+    hsv = cv2.cvtColor(clean, cv2.COLOR_BGR2HSV)
+
+    # Собираем маски по всем заданным диапазонам
+    combined_mask = np.zeros((clean.shape[0], clean.shape[1]), dtype=np.uint8)
+    for i in range(0, len(OBSTACLE_COLORS)):
+        lower = OBSTACLE_COLORS[i]
+        upper = OBSTACLE_COLORS[i]  # для простоты нижняя и верхняя границы одинаковы
+        # Но обычно у нас кортеж из 6 чисел, поэтому:
+        if len(lower) == 6:
+            mask = cv2.inRange(hsv, np.array(lower[:3]), np.array(lower[3:6]))
+        else:
+            mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+        combined_mask = cv2.bitwise_or(combined_mask, mask)
+
+    # Морфологическая очистка
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                           (MORPH_OPEN_KERNEL_SIZE, MORPH_OPEN_KERNEL_SIZE))
+    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel_open)
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                            (MORPH_CLOSE_KERNEL_SIZE, MORPH_CLOSE_KERNEL_SIZE))
+    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel_close)
+
+    # Упрощение до выпуклых оболочек
+    simplified = simplify_obstacle_mask(combined_mask,
+                                        max(1, int(OBSTACLE_MERGE_DIST_PX // scale)))
+
+    # Фильтр по минимальной площади
+    if scale > 1:
+        min_area_scaled = max(1, MIN_OBSTACLE_AREA_PX // (scale * scale))
+    else:
+        min_area_scaled = MIN_OBSTACLE_AREA_PX
+    contours, _ = cv2.findContours(simplified, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filtered = np.zeros_like(simplified)
+    for cnt in contours:
+        if cv2.contourArea(cnt) >= min_area_scaled:
+            cv2.drawContours(filtered, [cnt], -1, 255, cv2.FILLED)
+
+    # Возвращаем к полному размеру
+    if scale > 1:
+        filtered = cv2.resize(filtered, (w_full, h_full), interpolation=cv2.INTER_NEAREST)
+    return filtered
+
+def draw_obstacles(frame, binary_mask, expanded_mask=None):
+    if binary_mask is None:
+        return
+    # Контуры препятствий (красные)
+    contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
+        if cv2.contourArea(cnt) >= MIN_OBSTACLE_AREA_PX:
+            cv2.drawContours(frame, [cnt], -1, (0, 0, 255), 2)
+
+    # Если не передали готовую expanded, создадим её
+    if expanded_mask is None:
+        expand_px = int(OBSTACLE_SAFE_RADIUS_M * PIX_PER_METER)
+        kernel_size = int(expand_px * 2 + 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        expanded_mask = cv2.dilate(binary_mask, kernel, iterations=1)
+
+    expanded_contours, _ = cv2.findContours(expanded_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for ecnt in expanded_contours:
+        if cv2.contourArea(ecnt) >= MIN_OBSTACLE_AREA_PX:
+            cv2.drawContours(frame, [ecnt], -1, (255, 100, 0), 2)
+
+def draw_border(frame):
+    """Пунктирная граница (тёмно-серая)"""
+    h, w = frame.shape[:2]
+    m = int(BORDER_MARGIN_M * PIX_PER_METER)
+    pts = [(m, m), (w-m, m), (w-m, h-m), (m, h-m)]
+    for i in range(4):
+        cv2.line(frame, pts[i], pts[(i+1)%4], (100, 100, 100), 2, cv2.LINE_AA)
+
+def compute_expanded_mask(binary_mask):
+    if binary_mask is None:
         return None
-    rx, ry, rw, rh = roi
-    # Проверка попадания в ROI
-    if not (rx <= px <= rx + rw and ry <= py <= ry + rh):
-        return None
-    # world X: вправо, world Y: вверх (от нижней границы ROI)
-    wx = (px - rx) * (real_width / rw)
-    wy = (ry + rh - py) * (real_height / rh)
-    return (wx, wy)
+    expand_px = int(OBSTACLE_SAFE_RADIUS_M * PIX_PER_METER)
+    kernel_size = int(expand_px * 2 + 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    expanded = cv2.dilate(binary_mask, kernel, iterations=1)
+    return expanded
 
-def world_to_pixel(wx, wy):
-    """Преобразование мировых координат в пиксельные (для рисования)."""
-    if roi is None or real_width is None or real_height is None:
-        return None
-    rx, ry, rw, rh = roi
-    px = rx + (wx / real_width) * rw
-    py = ry + rh - (wy / real_height) * rh
-    return (int(px), int(py))
+# ================================================================
+#  РАЗДЕЛ 7: ПЛАНИРОВАНИЕ ПУТИ (A*, Dijkstra, Greedy, D*)
+# ================================================================
 
-def draw_interface(frame):
-    """Отрисовка ROI, робота, цели и траектории."""
-    # ROI
-    if roi is not None:
-        rx, ry, rw, rh = roi
-        cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), (255, 255, 0), 2)
-        cv2.putText(frame, "ROI", (rx, ry-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
-
-    # Траектория
-    if trajectory:
-        pts = []
-        for wx, wy in trajectory:
-            pt = world_to_pixel(wx, wy)
-            if pt:
-                pts.append(pt)
-        if len(pts) > 1:
-            cv2.polylines(frame, [np.array(pts)], False, (0, 255, 0), 2)
-
-    # Текущее положение робота
-    with robot_lock:
-        cur_x, cur_y, cur_phi = robot_x, robot_y, robot_phi
-        valid = robot_odom_valid
-    if valid and roi is not None:
-        pt = world_to_pixel(cur_x, cur_y)
-        if pt:
-            cv2.circle(frame, pt, 8, (0, 0, 255), -1)
-            arrow_len = 15
-            end_pt = (int(pt[0] + arrow_len * np.cos(cur_phi)),
-                      int(pt[1] - arrow_len * np.sin(cur_phi)))
-            cv2.arrowedLine(frame, pt, end_pt, (0, 0, 255), 2)
-
-    # Целевая точка
-    with target_lock:
-        tw = target_world
-    if tw is not None and roi is not None:
-        pt = world_to_pixel(tw[0], tw[1])
-        if pt:
-            cv2.drawMarker(frame, pt, (255, 0, 0), cv2.MARKER_CROSS, 15, 2)
-
-    return frame
-
-def main():
-    global roi, real_width, real_height, target_world
-
-    # Инициализация источника видео
-    source = VIDEO_SOURCE
-    # Если передан аргумент командной строки, используем его
-    if len(sys.argv) > 1:
-        arg = sys.argv[1]
-        # Попробуем интерпретировать как число (индекс камеры)
-        try:
-            source = int(arg)
-        except ValueError:
-            source = arg  # иначе считаем путём к файлу
-
-    cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
-        print(f"Не удалось открыть источник видео: {source}")
+def save_trajectory_plot(trajectory_world, trajectory_time, goal_world,
+                         planned_path, pix_per_meter,
+                         algorithm, smoothing):
+    """
+    Сохраняет линейные графики переходных характеристик X(t) и Y(t)
+    с реальными и модельными (запланированными) координатами.
+    Модельное время масштабируется под длительность реального движения.
+    """
+    if not trajectory_world or not trajectory_time:
         return
 
-    # Запуск потока одометрии
-    odom_thread = threading.Thread(target=odometry_thread, daemon=True)
-    odom_thread.start()
+    os.makedirs(LOG_DIR, exist_ok=True)
 
-    cv2.namedWindow("Robotino Control")
+    # ----- реальные данные -----
+    traj_x = [p[0] for p in trajectory_world]   # мировые X
+    traj_y = [p[1] for p in trajectory_world]   # мировые Y
+    t = list(trajectory_time)
+    t0 = t[0]
+    t_rel = [ti - t0 for ti in t]
+
+    # ----- модельная траектория (по planned_path) -----
+    t_model, x_model, y_model = [], [], []
+    if planned_path and len(planned_path) >= 2:
+        # перевод пикселей planned_path в мировые координаты
+        world_path = [(p[1] / pix_per_meter, p[0] / pix_per_meter)
+                      for p in planned_path]   # (X_world, Y_world)
+        # расчёт кумулятивных расстояний
+        dist = [0.0]
+        for i in range(1, len(world_path)):
+            d = math.hypot(world_path[i][0] - world_path[i-1][0],
+                           world_path[i][1] - world_path[i-1][1])
+            dist.append(dist[-1] + d)
+        # исходное модельное время при идеальной скорости MAX_SPEED
+        t_model_raw = [d / MAX_SPEED for d in dist]
+
+        # --- МАСШТАБИРОВАНИЕ ПОД РЕАЛЬНОЕ ВРЕМЯ ---
+        if t_rel and t_rel[-1] > 0 and t_model_raw[-1] > 0:
+            scale_factor = t_rel[-1] / t_model_raw[-1]
+        else:
+            scale_factor = 1.0
+        t_model = [t * scale_factor for t in t_model_raw]
+        # -------------------------------------------
+
+        x_model = [p[0] for p in world_path]
+        y_model = [p[1] for p in world_path]
+
+    # ----- цель -----
+    goal_x = goal_world[0]
+    goal_y = goal_world[1]
+
+    # ----- построение -----
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # График X(t)
+    ax1.plot(t_rel, traj_x, 'b-', linewidth=1.5, label='Real X')
+    if t_model:
+        ax1.plot(t_model, x_model, 'c--', linewidth=1.5, label='Model X (planned)')
+    ax1.axhline(y=goal_x, color='g', linestyle=':', label=f'Goal X={goal_x:.2f}')
+    ax1.set_xlabel('Time, s')
+    ax1.set_ylabel('X, m')
+    ax1.set_title('Step response X(t)')
+    ax1.grid(True)
+    ax1.legend()
+
+    # График Y(t)
+    ax2.plot(t_rel, traj_y, 'r-', linewidth=1.5, label='Real Y')
+    if t_model:
+        ax2.plot(t_model, y_model, 'm--', linewidth=1.5, label='Model Y (planned)')
+    ax2.axhline(y=goal_y, color='g', linestyle=':', label=f'Goal Y={goal_y:.2f}')
+    ax2.set_xlabel('Time, s')
+    ax2.set_ylabel('Y, m')
+    ax2.set_title('Step response Y(t)')
+    ax2.grid(True)
+    ax2.legend()
+
+    plt.tight_layout()
+
+    # ----- сохранение -----
+    safe_algo = algorithm.replace('*', 'star')
+    algo_str = f"{safe_algo}{'_smooth' if smoothing else ''}"
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join(LOG_DIR, f"transient_{algo_str}_{timestamp}.png")
+    plt.savefig(filename, dpi=150)
+    plt.close()
+    print(f"Transition graph saved: {filename}")
+    
+def simplify_path_dp(points, epsilon):
+    """Упрощает ломаную алгоритмом Дугласа–Пекера. epsilon — макс. расстояние в пикселях."""
+    if len(points) < 3 or epsilon <= 0:
+        return points
+    pts = np.array(points, dtype=np.float32)
+    # Используем встроенный approxPolyDP (он работает с целыми точками, поэтому временно округляем)
+    pts_int = pts.astype(np.int32).reshape((-1, 1, 2))
+    simplified = cv2.approxPolyDP(pts_int, epsilon, closed=False)
+    return [tuple(p[0]) for p in simplified]
+
+def smooth_path_catmull_rom(path, resolution_m, pix_per_meter):
+    """Возвращает гладкий путь с шагом примерно resolution_m (метры)."""
+    if len(path) < 2:
+        return path
+
+    # --- 1) Линейная интерполяция до равномерного шага -----------------
+    target_step = resolution_m * pix_per_meter
+    interpolated = [path[0]]
+    for i in range(1, len(path)):
+        x1, y1 = path[i-1]
+        x2, y2 = path[i]
+        seg_len = math.hypot(x2 - x1, y2 - y1)
+        if seg_len < target_step:
+            interpolated.append(path[i])
+            continue
+        num = max(1, int(seg_len / target_step) + 1)
+        for k in range(1, num):
+            t = k / num
+            x = x1 + (x2 - x1) * t
+            y = y1 + (y2 - y1) * t
+            interpolated.append((x, y))
+    if len(interpolated) < 2 or (abs(interpolated[-1][0] - path[-1][0]) > 1e-3 or
+                                 abs(interpolated[-1][1] - path[-1][1]) > 1e-3):
+        interpolated.append(path[-1])
+
+    # --- 2) Сглаживание Catmull‑Rom по интерполированному пути ---------
+    MIN_POINTS_PER_SEGMENT = 6
+    pts = np.array(interpolated, dtype=np.float32)
+    if len(pts) < 2:
+        return interpolated
+
+    pts_ext = np.vstack([pts[0], pts, pts[-1]])
+    dense = []
+    for i in range(len(pts) - 1):
+        p0 = pts_ext[i]
+        p1 = pts_ext[i+1]
+        p2 = pts_ext[i+2]
+        p3 = pts_ext[i+3]
+        seg_len = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+        num = max(MIN_POINTS_PER_SEGMENT, int(seg_len / target_step) + 1)
+        for t in np.linspace(0, 1, num, endpoint=False):
+            t2 = t * t
+            t3 = t2 * t
+            x = 0.5 * ((2*p1[0]) + (-p0[0] + p2[0]) * t +
+                       (2*p0[0] - 5*p1[0] + 4*p2[0] - p3[0]) * t2 +
+                       (-p0[0] + 3*p1[0] - 3*p2[0] + p3[0]) * t3)
+            y = 0.5 * ((2*p1[1]) + (-p0[1] + p2[1]) * t +
+                       (2*p0[1] - 5*p1[1] + 4*p2[1] - p3[1]) * t2 +
+                       (-p0[1] + 3*p1[1] - 3*p2[1] + p3[1]) * t3)
+            dense.append((x, y))
+    dense.append(pts[-1])
+
+    # --- 3) Финальный ресамплинг для однородности --------------------
+    if not dense:
+        return dense
+
+    resampled = [dense[0]]
+    accum = 0.0
+    for i in range(1, len(dense)):
+        dx = dense[i][0] - dense[i-1][0]
+        dy = dense[i][1] - dense[i-1][1]
+        seg_len = math.hypot(dx, dy)
+        if seg_len == 0:
+            continue
+        while accum + seg_len >= target_step:
+            ratio = (target_step - accum) / seg_len
+            x = dense[i-1][0] + dx * ratio
+            y = dense[i-1][1] + dy * ratio
+            resampled.append((x, y))
+            accum = 0.0
+            seg_len -= target_step
+            dense[i-1] = (x, y)
+        accum += seg_len
+    if math.hypot(resampled[-1][0] - dense[-1][0], resampled[-1][1] - dense[-1][1]) > 1e-3:
+        resampled.append(dense[-1])
+
+    return resampled
+
+# Вспомогательные функции для поиска пути
+def reconstruct_path(came_from, current):
+    path = [current]
+    while current in came_from:
+        current = came_from[current]
+        path.append(current)
+    path.reverse()
+    return path
+
+def get_neighbors(node, w, h):
+    x, y = node
+    neighbors = []
+    for dx, dy in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]:
+        nx, ny = x + dx, y + dy
+        if 0 <= nx < w and 0 <= ny < h:
+            neighbors.append(((nx, ny), math.hypot(dx, dy)))
+    return neighbors
+
+def astar_search(small_mask, start, goal):
+    w, h = small_mask.shape[::-1]
+    open_set = [(0, start)]
+    came_from = {}
+    g_score = {start: 0}
+    f_score = {start: math.hypot(goal[0]-start[0], goal[1]-start[1])}
+
+    while open_set:
+        open_set.sort(key=lambda x: x[0])
+        _, current = open_set.pop(0)
+        if current == goal:
+            return reconstruct_path(came_from, current)
+
+        for (neighbor, cost) in get_neighbors(current, w, h):
+            if small_mask[neighbor[1], neighbor[0]] != 0:
+                continue
+            tentative_g = g_score[current] + cost
+            if neighbor not in g_score or tentative_g < g_score[neighbor]:
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative_g
+                f_score[neighbor] = tentative_g + math.hypot(goal[0]-neighbor[0], goal[1]-neighbor[1])
+                open_set.append((f_score[neighbor], neighbor))
+    return []
+
+def dijkstra_search(small_mask, start, goal):
+    w, h = small_mask.shape[::-1]
+    open_set = [(0, start)]
+    came_from = {}
+    g_score = {start: 0}
+
+    while open_set:
+        open_set.sort(key=lambda x: x[0])
+        _, current = open_set.pop(0)
+        if current == goal:
+            return reconstruct_path(came_from, current)
+
+        for (neighbor, cost) in get_neighbors(current, w, h):
+            if small_mask[neighbor[1], neighbor[0]] != 0:
+                continue
+            tentative_g = g_score[current] + cost
+            if neighbor not in g_score or tentative_g < g_score[neighbor]:
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative_g
+                open_set.append((g_score[neighbor], neighbor))
+    return []
+
+def greedy_search(small_mask, start, goal):
+    w, h = small_mask.shape[::-1]          # w, h — размеры карты
+    start_h = math.hypot(goal[0]-start[0], goal[1]-start[1])
+    open_set = [(start_h, start)]
+    came_from = {}
+    closed_set = set()                     # посещённые узлы
+
+    while open_set:
+        open_set.sort(key=lambda x: x[0])
+        _, current = open_set.pop(0)
+        if current == goal:
+            return reconstruct_path(came_from, current)
+        if current in closed_set:
+            continue
+        closed_set.add(current)
+
+        for (neighbor, _) in get_neighbors(current, w, h):
+            if small_mask[neighbor[1], neighbor[0]] != 0:
+                continue
+            if neighbor not in came_from and neighbor not in closed_set:
+                came_from[neighbor] = current
+                # чистая эвристика (без учёта стоимости пути)
+                priority = math.hypot(goal[0]-neighbor[0], goal[1]-neighbor[1])
+                open_set.append((priority, neighbor))
+    return []
+
+def bidirectional_search(small_mask, start, goal):
+    """Двунаправленный A*: одновременный поиск от старта и цели."""
+    w, h = small_mask.shape[::-1]
+
+    # Инициализация для прямого поиска (от старта)
+    open_fwd = [(0, start)]
+    g_fwd = {start: 0}
+    parent_fwd = {}
+
+    # Инициализация для обратного поиска (от цели)
+    open_bwd = [(0, goal)]
+    g_bwd = {goal: 0}
+    parent_bwd = {}
+
+    # Множество встречи
+    intersection = None
+    best_cost = float('inf')
+
+    while open_fwd or open_bwd:
+        # Шаг прямого поиска
+        if open_fwd:
+            open_fwd.sort(key=lambda x: x[0])
+            _, current = open_fwd.pop(0)
+
+            # Проверяем, не встретились ли мы с обратным поиском
+            if current in g_bwd:
+                total_cost = g_fwd[current] + g_bwd[current]
+                if total_cost < best_cost:
+                    best_cost = total_cost
+                    intersection = current
+
+            for (neighbor, cost) in get_neighbors(current, w, h):
+                if small_mask[neighbor[1], neighbor[0]] != 0:
+                    continue
+                tentative_g = g_fwd[current] + cost
+                if neighbor not in g_fwd or tentative_g < g_fwd[neighbor]:
+                    parent_fwd[neighbor] = current
+                    g_fwd[neighbor] = tentative_g
+                    priority = tentative_g + math.hypot(goal[0]-neighbor[0], goal[1]-neighbor[1])
+                    open_fwd.append((priority, neighbor))
+
+        # Шаг обратного поиска
+        if open_bwd:
+            open_bwd.sort(key=lambda x: x[0])
+            _, current = open_bwd.pop(0)
+
+            if current in g_fwd:
+                total_cost = g_fwd[current] + g_bwd[current]
+                if total_cost < best_cost:
+                    best_cost = total_cost
+                    intersection = current
+
+            for (neighbor, cost) in get_neighbors(current, w, h):
+                if small_mask[neighbor[1], neighbor[0]] != 0:
+                    continue
+                tentative_g = g_bwd[current] + cost
+                if neighbor not in g_bwd or tentative_g < g_bwd[neighbor]:
+                    parent_bwd[neighbor] = current
+                    g_bwd[neighbor] = tentative_g
+                    priority = tentative_g + math.hypot(start[0]-neighbor[0], start[1]-neighbor[1])
+                    open_bwd.append((priority, neighbor))
+
+        # Если найдена точка встречи и оставшиеся узлы имеют оценку хуже – завершаем
+        if intersection is not None:
+            if (not open_fwd or open_fwd[0][0] >= best_cost) and \
+               (not open_bwd or open_bwd[0][0] >= best_cost):
+                break
+
+    if intersection is None:
+        return []
+
+    # Восстановление пути: от intersection к старту и к цели
+    path_fwd = reconstruct_path(parent_fwd, intersection)
+    path_bwd = reconstruct_path(parent_bwd, intersection)
+    # Объединяем (без дублирования точки встречи)
+    path = path_fwd[:-1] + path_bwd[::-1]
+    return path
+
+# Основная функция планирования
+def plan_path(expanded_mask, start_px, goal_px, plan_scale=4):
+    """Планирует путь на уменьшенной маске выбранным алгоритмом."""
+    if expanded_mask is None:
+        return []
+
+    small_mask = cv2.resize(expanded_mask, None, fx=1/plan_scale, fy=1/plan_scale,
+                            interpolation=cv2.INTER_NEAREST)
+    h_s, w_s = small_mask.shape
+    start = (int(start_px[0] / plan_scale), int(start_px[1] / plan_scale))
+    goal = (int(goal_px[0] / plan_scale), int(goal_px[1] / plan_scale))
+
+    if not (0 <= start[0] < w_s and 0 <= start[1] < h_s):
+        return []
+    if not (0 <= goal[0] < w_s and 0 <= goal[1] < h_s):
+        return []
+
+    if small_mask[start[1], start[0]] != 0 or small_mask[goal[1], goal[0]] != 0:
+        return []
+
+    # Выбор алгоритма
+    if PATH_ALGORITHM == "A*":
+        path = astar_search(small_mask, start, goal)
+    elif PATH_ALGORITHM == "Dijkstra":
+        path = dijkstra_search(small_mask, start, goal)
+    elif PATH_ALGORITHM == "Greedy":
+        path = greedy_search(small_mask, start, goal)
+    elif PATH_ALGORITHM == "Bidirectional":
+        path = bidirectional_search(small_mask, start, goal)
+    else:
+        path = astar_search(small_mask, start, goal)
+
+    if not path:
+        return []
+
+    path_full = [(p[0]*plan_scale, p[1]*plan_scale) for p in path]
+    return path_full
+
+# ================================================================
+#  РАЗДЕЛ 8: ГЛАВНЫЙ ЦИКЛ
+# ================================================================
+
+def main():
+    # ================================================================
+    #  РАЗДЕЛ 8.1: все глобальные переменные
+    # ================================================================
+    global M, calib_points, target_world, robot_pos, trajectory_world, last_send_time
+    global warp_window_initialized, planned_path, goal_prev, waypoint_index, last_odom_time 
+    global current_vx_world, current_vy_world, last_wp_index, goal_just_reached, plot_saved
+    global initial_planned_path
+    
+    goal_just_reached = False
+    plot_saved = False
+            
+    frame_count = 0
+    last_binary_obs = None
+    static_binary_mask = None
+    
+    planned_path = []
+    goal_prev = None
+    waypoint_index = 0
+    
+    current_vx_world = 0.0
+    current_vy_world = 0.0
+    
+    # ================================================================
+    #  РАЗДЕЛ 8.2: Видео
+    # ================================================================
+    # Открытие источника видео
+    if USE_CAMERA:
+        # Пробуем открыть с DirectShow (стабильнее на Windows)
+        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            # fallback на авто-бэкенд
+            cap = cv2.VideoCapture(CAMERA_INDEX)
+    else:
+        cap = cv2.VideoCapture(VIDEO_NAME)
+    
+    if not cap.isOpened():
+        print(f"Ошибка: не удалось открыть {'камеру ' + str(CAMERA_INDEX) if USE_CAMERA else VIDEO_NAME}")
+        time.sleep(3)
+        return
+    
+        # ------------------- Диалог загрузки калибровки -------------------
+    if os.path.exists(CALIB_FILE):
+        # Показываем чёрный кадр с вопросом
+        dialog_frame = np.zeros((300, 500, 3), dtype=np.uint8)
+        cv2.putText(dialog_frame, "Change field borders? (y/n)", (20, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.imshow("Calibration Dialog", dialog_frame)
+        key = -1
+        while key not in [ord('y'), ord('n'), 27]:  # 27 = Escape
+            key = cv2.waitKey(100) & 0xFF
+        cv2.destroyWindow("Calibration Dialog")
+        if key == ord('n'):
+            if load_calibration():
+                # Калибровка загружена – M уже не None
+                pass
+            else:
+                print("Не удалось загрузить калибровку. Переход к ручной расстановке.")
+                M = None
+                calib_points = []
+        else:
+            # Пользователь хочет изменить – сбрасываем старую калибровку
+            M = None
+            calib_points = []
+            static_binary_mask = None
+            # Удалим старый файл, чтобы не загружался снова
+            try:
+                os.remove(CALIB_FILE)
+            except:
+                pass
+
+    # Создаём окно с возможностью изменения размера
+    cv2.namedWindow("Robotino Control", cv2.WINDOW_NORMAL)
     cv2.setMouseCallback("Robotino Control", mouse_callback)
-
-    print("Инструкция:")
-    print(" - 'r' : задать ROI (выделите прямоугольник мышью и нажмите Enter/Space)")
-    print(" - 'c' : очистить траекторию")
-    print(" - 'q' : выход")
-    print(" - ЛКМ по изображению : задать целевую точку")
-    print("Для калибровки нажмите 'r' и выделите поле.")
-    print(f"Источник видео: {'камера' if isinstance(source, int) else source}")
-
+    
     while True:
+        # ============================================
+        #  РАЗДЕЛ 8.3: ЧТЕНИЕ КАДРА
+        # ============================================
+        
+        warp_size = (int(FIELD_WIDTH * PIX_PER_METER), int(FIELD_HEIGHT * PIX_PER_METER))
         ret, frame = cap.read()
         if not ret:
-            # Если видеофайл закончился, перезапустим его
-            if isinstance(source, str):
+            # обработка конца видео (без изменений)
+            if not USE_CAMERA and LOOP_VIDEO:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
             else:
-                print("Ошибка захвата кадра с камеры.")
+                frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(frame, "Video ended. Close window to exit.", (50, 240),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.imshow("Robotino Control", frame)
+                while cv2.getWindowProperty("Robotino Control", cv2.WND_PROP_VISIBLE) >= 1:
+                    if cv2.waitKey(100) & 0xFF == ord('q'):
+                        break
                 break
 
-        # Обработка движения к цели
-        with target_lock:
-            tw = target_world
-        if tw is not None:
-            with robot_lock:
-                rx, ry = robot_x, robot_y
-                valid = robot_odom_valid
-            if valid:
-                dx = tw[0] - rx
-                dy = tw[1] - ry
-                dist = np.hypot(dx, dy)
-                if dist < DIST_THRESHOLD:
-                    with target_lock:
-                        target_world = None
-                    send_velocity(0, 0, 0)
-                else:
-                    vx = np.clip(KP * dx, -MAX_SPEED, MAX_SPEED)
-                    vy = np.clip(KP * dy, -MAX_SPEED, MAX_SPEED)
-                    send_velocity(vx, vy, 0)
-            else:
-                send_velocity(0, 0, 0)
+        # --- Шаг 1: показать калибровочные точки на ИСХОДНОМ кадре (для отладки) ---
+        debug_frame = frame.copy()
+        draw_calibration_points(debug_frame)
+        draw_field(debug_frame)
+        cv2.putText(debug_frame, "Click corners: TL, TR, BR, BL", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+        # --- Шаг 2: трансформация, если калибровка завершена ---
+        if M is not None:
+            working_frame = cv2.warpPerspective(frame, M, warp_size)
+            # Без проверки чёрного
         else:
-            send_velocity(0, 0, 0)
+            working_frame = frame
+            
+        # ============================================
+        #  РАЗДЕЛ 8.4: ДЕТЕКЦИЯ РОБОТА
+        # ============================================
+        
+        det = detect_robot(working_frame)
+        robot_pix = None
+        marker_corners = None
+        if det is not None:
+            px, py, phi, corners = det        
+            robot_pix = (int(px), int(py))
+            marker_corners = corners
+            phi = 0.0  # Голономный робот: угол всегда 0
+            if M is not None:
+                # Мировая X (вниз) = пиксельная Y
+                wx = py / PIX_PER_METER
+                # Мировая Y (вправо) = пиксельная X
+                wy = px / PIX_PER_METER
+                robot_pos = (wx, wy, phi)
+                trajectory_world.append((wx, wy))
+                trajectory_time.append(time.time())
+            else:
+                robot_pos = (px, py, phi)
+        else:
+            robot_pos = None
+            
+        # ============================================
+        #  РАЗДЕЛ 8.5: ЧТЕНИЕ ОДОМЕТРИИ
+        # ============================================
+        if time.time() - last_odom_time > 0.2:
+            odom_data = get_odometry()
+            last_odom_time = time.time()
+        else:
+            odom_data = None
+        
+        if odom_data is not None:
+            # odom_data = [x, y, phi, ...] – координаты в системе робота
+            odom_x, odom_y, odom_phi = odom_data[0], odom_data[1], odom_data[2]
+            odom_text = f"Odom: x={odom_x:.2f} y={odom_y:.2f} phi={math.degrees(odom_phi):.0f}"
+        else:
+            odom_text = ""
+            
+        # ============================================
+        #  РАЗДЕЛ 8.6: ОБРАБОТКА ПРЕПЯТСТВИЙ
+        # ============================================
+        expanded_mask = None
+        planning_mask = None
+        if M is not None:
+            if OBSTACLE_MODE == "static":
+                if static_binary_mask is None:
+                    static_binary_mask = detect_obstacles(working_frame, robot_pix, marker_corners, OBSTACLE_PROCESS_SCALE)
+                last_binary_obs = static_binary_mask
+            else:  # dynamic
+                if frame_count % PROCESS_EVERY_N_FRAMES == 0:
+                    last_binary_obs = detect_obstacles(working_frame, robot_pix, marker_corners, OBSTACLE_PROCESS_SCALE)
+                frame_count += 1
 
-        # Сохранение траектории
-        with robot_lock:
-            if robot_odom_valid:
-                trajectory.append((robot_x, robot_y))
+            if last_binary_obs is not None:
+                # Чистая расширенная маска для отрисовки и избегания (без рамки)
+                expanded_mask = compute_expanded_mask(last_binary_obs)
 
-        # Визуализация
-        frame = draw_interface(frame)
-        cv2.imshow("Robotino Control", frame)
+                # Планировочная маска: сначала копируем expanded_mask,
+                # затем дополнительно расширяем на PLANNING_EXTRA_RADIUS_M
+                extra_px = int(PLANNING_EXTRA_RADIUS_M * PIX_PER_METER)
+                if extra_px > 0:
+                    kernel_extra = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                                             (extra_px * 2 + 1, extra_px * 2 + 1))
+                    planning_mask = cv2.dilate(expanded_mask, kernel_extra, iterations=1)
+                else:
+                    planning_mask = expanded_mask.copy()
 
-        key = cv2.waitKey(20) & 0xFF
-        if key == ord('q'):
+                # Добавляем граничную рамку (только в planning_mask)
+                border_px = int(BORDER_MARGIN_M * PIX_PER_METER)
+                if border_px > 0:
+                    planning_mask[:border_px, :] = 255
+                    planning_mask[-border_px:, :] = 255
+                    planning_mask[:, :border_px] = 255
+                    planning_mask[:, -border_px:] = 255
+            else:
+                expanded_mask = None
+                planning_mask = None
+
+            draw_obstacles(working_frame, last_binary_obs, expanded_mask)
+            draw_border(working_frame)
+        
+        # ============================================
+        #  РАЗДЕЛ 8.7: ПЛАНИРОВАНИЕ МАРШРУТА
+        # ============================================
+        if M is not None and target_world is not None and robot_pix is not None:
+            tpx = int(target_world[1] * PIX_PER_METER)
+            tpy = int(target_world[0] * PIX_PER_METER)
+            # Пересчитываем путь при новой цели или если маска обновилась (dynamic) и мы не достигли цели
+            need_new_plan = (target_world != goal_prev)
+            if OBSTACLE_MODE == "dynamic" and last_binary_obs is not None:
+                need_new_plan = need_new_plan or (frame_count % PROCESS_EVERY_N_FRAMES == 0)
+            if need_new_plan:
+                if expanded_mask is not None:
+                    planned_path = plan_path(planning_mask, robot_pix, (tpx, tpy), OBSTACLE_PROCESS_SCALE)
+                    if PATH_SMOOTHING and planned_path:
+                        if SIMPLIFY_EPSILON_PX > 0:
+                            planned_path = simplify_path_dp(planned_path, SIMPLIFY_EPSILON_PX)
+                    planned_path = smooth_path_catmull_rom(planned_path, SPLINE_RESOLUTION, PIX_PER_METER)
+                    # --- сохраняем исходный план, если ещё не сохранён ---
+                    if not initial_planned_path:
+                        initial_planned_path = list(planned_path)
+                    # ----------------------------------------------------
+                    last_wp_index = 0
+                else:
+                    planned_path = []
+                goal_prev = target_world
+                waypoint_index = 0
+        else:
+            planned_path = []
+            waypoint_index = 0
+            
+        # ============================================
+        #  РАЗДЕЛ 8.8: ОТРИСОВКА ВСЕХ ЭЛЕМЕНТОВ
+        # ============================================
+        
+        if M is None:
+            # Исходный режим калибровки
+            draw_field(working_frame)
+            draw_calibration_points(working_frame)
+        else:
+            draw_trajectory(working_frame)
+            # Вычисляем пиксельные координаты робота один раз
+            if robot_pos is not None:
+                rpx = int(robot_pos[1] * PIX_PER_METER)
+                rpy = int(robot_pos[0] * PIX_PER_METER)
+                cv2.drawMarker(working_frame, (rpx, rpy), (0, 255, 255), cv2.MARKER_CROSS, 20, 2)
+                # направление
+                phi = robot_pos[2]
+                dx = int(30 * math.cos(phi))
+                dy = int(30 * math.sin(phi))
+                cv2.arrowedLine(working_frame, (rpx, rpy), (rpx+dx, rpy+dy), (0, 255, 255), 2)
+                cv2.putText(working_frame, 
+                            f"R({robot_pos[0]:.2f}, {robot_pos[1]:.2f}, {math.degrees(phi):.0f})",
+                            (rpx+10, rpy-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1)
+            if target_world is not None:
+                tpx = int(target_world[1] * PIX_PER_METER)
+                tpy = int(target_world[0] * PIX_PER_METER)
+                cv2.circle(working_frame, (tpx, tpy), 8, (0, 0, 255), -1)
+                cv2.circle(working_frame, (tpx, tpy), 10, (0, 0, 255), 2)
+                cv2.putText(working_frame, f"G({target_world[0]:.2f}, {target_world[1]:.2f})",
+                            (tpx+10, tpy-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
+
+        # Отрисовка запланированного пути
+        if planned_path and len(planned_path) > 1:
+            pts = [(int(p[0]), int(p[1])) for p in planned_path]  # planned_path уже в пикселях полного разрешения
+            for i in range(1, len(pts)):
+                cv2.line(working_frame, pts[i-1], pts[i], (255, 0, 0), 2)  # красный путь
+            # Текущий waypoint
+            if CONTROL and robot_pos is not None and planned_path and 'tx' in locals() and 'ty' in locals():
+                px_target = int(ty * PIX_PER_METER)   # мировая Y → пиксельная X
+                py_target = int(tx * PIX_PER_METER)   # мировая X → пиксельная Y
+                cv2.circle(working_frame, (px_target, py_target), 6, (255, 255, 0), -1)
+        
+        if M is not None and warp_size != (0, 0):
+            cv2.resizeWindow("Robotino Control", working_frame.shape[0], working_frame.shape[1])
+            
+        # Отображение одометрии на кадре
+        if odom_text:
+            cv2.putText(working_frame, odom_text, (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1) 
+
+         # Отображение текста слева сверху на кадре
+        if M is None:
+            mode_text = "Calibration"
+        else:
+            if CONTROL:
+                mode_text = f"Control [{PATH_ALGORITHM}] ({OBSTACLE_MODE})"
+            else:
+                mode_text = "Video only"
+        cv2.putText(working_frame, mode_text, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+        # Отображение статуса (скорость, позиция, цель) справа сверху
+        draw_status_info(working_frame, robot_pos, target_world, current_vx_world, current_vy_world)
+        
+        cv2.imshow("Robotino Control", working_frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or cv2.getWindowProperty("Robotino Control", cv2.WND_PROP_VISIBLE) < 1:
             break
-        elif key == ord('r'):
-            roi_rect = cv2.selectROI("Robotino Control", frame, showCrosshair=True, fromCenter=False)
-            if roi_rect[2] > 0 and roi_rect[3] > 0:
-                roi = roi_rect
-                try:
-                    w_str = input("Введите реальную ширину поля (метры): ")
-                    h_str = input("Введите реальную высоту поля (метры): ")
-                    real_width = float(w_str)
-                    real_height = float(h_str)
-                    print(f"ROI задан: {roi}, размеры {real_width}x{real_height} м")
-                    trajectory.clear()
-                    with target_lock:
-                        target_world = None
-                except ValueError:
-                    print("Ошибка ввода чисел. Калибровка не выполнена.")
-                    roi = None
-            cv2.destroyWindow("ROI selector")
-        elif key == ord('c'):
-            trajectory.clear()
-            print("Траектория очищена.")
 
-    send_velocity(0, 0, 0)
+        # ============================================
+        #  РАЗДЕЛ 8.9: УПРАВЛЕНИЕ РОБОТОМ
+        # ============================================
+
+        if CONTROL:
+            if robot_pos is not None and target_world is not None and M is not None:
+                wx, wy, phi = robot_pos
+                gx, gy = target_world
+                distance = math.hypot(gx - wx, gy - wy)
+
+                # ========== Динамический выход из препятствия (локальный поиск) ==========
+                if OBSTACLE_MODE == "dynamic" and expanded_mask is not None:
+                    rpx = int(wy * PIX_PER_METER)   # мировые Y -> пиксельные X
+                    rpy = int(wx * PIX_PER_METER)   # мировые X -> пиксельные Y
+                    h_mask, w_mask = expanded_mask.shape
+                    if 0 <= rpx < w_mask and 0 <= rpy < h_mask and expanded_mask[rpy, rpx] != 0:
+                        # Ищем ближайший свободный пиксель в квадратной окрестности
+                        best_d2 = float('inf')
+                        best_x = best_y = 0
+                        search_radius = int(OBSTACLE_SAFE_RADIUS_M * PIX_PER_METER) + 0  # можно менять
+                        for dy in range(-search_radius, search_radius + 1):
+                            for dx in range(-search_radius, search_radius + 1):
+                                nx = rpx + dx
+                                ny = rpy + dy
+                                if 0 <= nx < w_mask and 0 <= ny < h_mask and expanded_mask[ny, nx] == 0:
+                                    d2 = dx*dx + dy*dy
+                                    if d2 < best_d2:
+                                        best_d2 = d2
+                                        best_x, best_y = nx, ny
+                        if best_d2 != float('inf'):
+                            escape_px, escape_py = best_x, best_y
+                            escape_wx = escape_py / PIX_PER_METER
+                            escape_wy = escape_px / PIX_PER_METER
+                            dx = escape_wx - wx
+                            dy = escape_wy - wy
+                            dist_escape = math.hypot(dx, dy)
+                            if dist_escape > 0:
+                                vx_world = (dx / dist_escape) * MAX_SPEED * 0.5
+                                vy_world = (dy / dist_escape) * MAX_SPEED * 0.5
+                                if time.time() - last_send_time > SEND_INTERVAL:
+                                    safe_send(vx_world, vy_world, 0.0)
+                                    last_send_time = time.time()
+                            # Опционально: отрисовка точки выхода (синий кружок)
+                            cv2.circle(working_frame, (escape_px, escape_py), 5, (255, 0, 0), -1)
+                            continue  # пропускаем основную логику движения до следующего кадра
+                # ============================================================
+
+                if distance < GOAL_TOLERANCE:
+                    current_vx_world = 0.0
+                    current_vy_world = 0.0
+                    if time.time() - last_send_time > SEND_INTERVAL:
+                        safe_send(0.0, 0.0, 0.0)
+                    # Сохраняем график, если ещё не сохранили для этой цели
+                        if not plot_saved and (trajectory_world and trajectory_time):
+                            save_trajectory_plot(
+                                trajectory_world, trajectory_time, target_world,
+                                initial_planned_path if initial_planned_path else planned_path,  
+                                PIX_PER_METER, PATH_ALGORITHM, PATH_SMOOTHING)
+                            plot_saved = True
+                        last_send_time = time.time()
+                else:
+                    # Если путь не построен (траектория пуста) – робот стоит
+                    if not planned_path:
+                        current_vx_world = 0.0
+                        current_vy_world = 0.0
+                        if time.time() - last_send_time > SEND_INTERVAL:
+                            safe_send(0.0, 0.0, 0.0)
+                            last_send_time = time.time()
+                        continue   # пропускаем всю дальнейшую логику до следующего кадра
+
+                    # ---------- ВЫБОР ЦЕЛЕВОЙ ТОЧКИ (заглядываем вперёд) ----------
+                    lookahead_m = WP_THRESHOLD_M
+                    tx, ty = gx, gy            # финальная цель по умолчанию
+                    target_is_goal = True
+
+                    # Ищем точку впереди, начиная с last_wp_index, чтобы не возвращаться
+                    found = False
+                    for i in range(last_wp_index, len(planned_path)):
+                        wp = planned_path[i]
+                        wpx = wp[1] / PIX_PER_METER
+                        wpy = wp[0] / PIX_PER_METER
+                        if math.hypot(wpx - wx, wpy - wy) >= lookahead_m:
+                            tx, ty = wpx, wpy
+                            target_is_goal = (i == len(planned_path) - 1)
+                            last_wp_index = i
+                            found = True
+                            break
+                    if not found:
+                        # Если не нашли — остаёмся на финальной цели
+                        tx, ty = gx, gy
+                        target_is_goal = True
+
+                    # Вычисляем вектор до выбранной точки
+                    dx = tx - wx
+                    dy = ty - wy
+                    dist_to_target = math.hypot(dx, dy)
+
+                    # Остановка только у финальной цели
+                    if target_is_goal and dist_to_target < GOAL_TOLERANCE:
+                        current_vx_world = 0.0
+                        current_vy_world = 0.0
+                        if time.time() - last_send_time > SEND_INTERVAL:
+                            safe_send(0.0, 0.0, 0.0)
+                            last_send_time = time.time()
+                    else:
+                        # Направление к цели
+                        if dist_to_target > 0:
+                            # Торможение только перед самой финальной целью
+                            if target_is_goal and dist_to_target < GOAL_TOLERANCE :
+                                speed = MAX_SPEED * (dist_to_target / (GOAL_TOLERANCE))
+                            else:
+                                speed = MAX_SPEED
+                            vx_world = (dx / dist_to_target) * speed
+                            vy_world = (dy / dist_to_target) * speed
+                        else:
+                            vx_world = 0.0
+                            vy_world = 0.0
+
+                        current_vx_world = vx_world
+                        current_vy_world = vy_world
+
+                        # --- Голономный робот: скорости напрямую в мировую систему ---
+                        vx_local = vx_world
+                        vy_local = vy_world
+                        omega = 0.0
+
+                        if time.time() - last_send_time > SEND_INTERVAL:
+                            safe_send(vx_local, vy_local, omega)
+                            last_send_time = time.time()
+                    
+            elif robot_pos is None and target_world is not None:
+                if time.time() - last_send_time > SEND_INTERVAL:
+                    safe_send(0.0, 0.0, 0.0)
+                    last_send_time = time.time()
+
+    if CONTROL:
+        safe_send(0.0, 0.0, 0.0)
     cap.release()
     cv2.destroyAllWindows()
-
-def mouse_callback(event, x, y, flags, param):
-    """Обработчик кликов мыши: установка целевой точки."""
-    global target_world
-    if event == cv2.EVENT_LBUTTONDOWN:
-        if roi is not None:
-            wpt = pixel_to_world(x, y)
-            if wpt is not None:
-                with target_lock:
-                    target_world = wpt
-                print(f"Цель: X={wpt[0]:.3f} м, Y={wpt[1]:.3f} м")
 
 if __name__ == "__main__":
     main()
