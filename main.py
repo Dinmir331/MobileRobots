@@ -6,6 +6,8 @@ import cv2
 import numpy as np
 import time
 import math
+import heapq
+import threading
 
 from collections import deque
 from Robotino_communication import send_velocity, get_odometry
@@ -34,8 +36,9 @@ CAMERA_INDEX = 0                # индекс камеры или путь к �
 VIDEO_NAME = "video_4.mp4"      # название файла видео
 LOOP_VIDEO = False              # зацикливать видеофайл при окончании
 SEND_INTERVAL = 0.05             # секунды, минимальный интервал отправки команд
-PIX_PER_METER = 400             # Масштаб: сколько пикселей в одном метре на выходном изображении
-OBSTACLE_PROCESS_SCALE = 5      # во сколько раз уменьшать изображение для обработки препятствий (ускоряет расчёт)
+PIX_PER_METER = 200             # Масштаб: сколько пикселей в одном метре на выходном изображении
+OBSTACLE_PROCESS_SCALE = 1      # во сколько раз уменьшать изображение для обработки препятствий (ускоряет расчёт)
+remap_maps = None               # Карты для cv2.remap
 
 trajectory_world = deque(maxlen=1000)  # очередь пройденных позиций
 trajectory_time = deque(maxlen=1000)   # метки времени для каждой позиции
@@ -43,32 +46,46 @@ trajectory_time = deque(maxlen=1000)   # метки времени для каж
 # распознавание цветов на картинке // ЦВЕТОВЫЕ ДИАПАЗОНЫ ПРЕПЯТСТВИЙ (HSV)
 # Каждый диапазон: (H_low, S_low, V_low, H_high, S_high, V_high)
 # H от 0 до 179, S и V от 0 до 255
+#OBSTACLE_COLORS = [
+    # Чёрный: только ограничение по яркости V_high = 100
+#    (0, 0, 0, 179, 255, 180),
+    # Красный 1 диапазон (H: 0-10, S: 60-255, V: 50-255)
+ #   (0, 60, 50, 10, 255, 255),
+    # Красный 2 диапазон (H: 100-179, S: 60-255, V: 40-255)
+    # (H_high=180 скорректирован до 179 – это максимум в OpenCV)
+#    (100, 60, 40, 179, 255, 255),
+    # Зелёный (H: 30-100, S: 60-255, V: 30-255)
+ #   (30, 60, 30, 100, 255, 255),
+    # Синий (H: 80-140, S: 70-255, V: 50-255)
+#    (80, 70, 50, 140, 255, 255)
+#]
+
 OBSTACLE_COLORS = [
-    (0, 0, 0, 120, 255, 150), # Чёрный (низкая яркость) V > 30 - серый
-    (0, 50, 50, 10, 255, 255), # Красный (1 диапазон)
-    (160, 50, 50, 180, 255, 255), # Красный (2 диапазон)
-    (40, 50, 50, 80, 255, 255), # Зелёный
-    (100, 50, 50, 130, 255, 255) # Синий
+     (0, 0, 0, 0, 0, 0), # Чёрный (низкая яркость) V > 30 - серый
+     (0, 50, 50, 10, 255, 255), # Красный (1 диапазон)
+     (160, 50, 50, 180, 255, 255), # Красный (2 диапазон)
+     (40, 50, 50, 80, 255, 255), # Зелёный
+     (100, 50, 50, 130, 255, 255) # Синий
 ]
 # Морфология для очистки маски
 MORPH_OPEN_KERNEL_SIZE = 5        # размер ядра открытия (убрать шум)
-MORPH_CLOSE_KERNEL_SIZE = 13      # размер ядра закрытия (заполнить дыры)
+MORPH_CLOSE_KERNEL_SIZE = 15      # размер ядра закрытия (заполнить дыры)
 
 # распознавание препятствий
 MIN_OBSTACLE_AREA_PX = 150      # минимальная площадь препятствия в пикселях (меньше — игнорируем)
-OBSTACLE_MERGE_DIST_PX = 1      # расстояние в пикселях для слияния близких препятствий
-PROCESS_EVERY_N_FRAMES = 5      # обрабатывать препятствия каждый N-й кадр (1 — каждый)
+OBSTACLE_MERGE_DIST_PX = 5      # расстояние в пикселях для слияния близких препятствий
+PROCESS_EVERY_N_FRAMES = 30      # обрабатывать препятствия каждый N-й кадр (1 — каждый)
 BORDER_MARGIN_M = 0.15           # отступ от края поля в метрах
-OBSTACLE_SAFE_RADIUS_M = 0.33    # безопасный радиус вокруг препятствий в метрах (не меняется при масштабе)
-PLANNING_EXTRA_RADIUS_M = 0.02   # дополнительный отступ при построении маршрута (метры)
+OBSTACLE_SAFE_RADIUS_M = 0.3    # безопасный радиус вокруг препятствий в метрах (не меняется при масштабе)
+PLANNING_EXTRA_RADIUS_M = 0.001   # дополнительный отступ при построении маршрута (метры)
 
 # Габариты робота и поля
-ROBOT_DIAMETER_M = 0.53      # диаметр робота в метрах (для исключения из препятствий)
+ROBOT_DIAMETER_M = 0.6      # диаметр робота в метрах (для исключения из препятствий)
 FIELD_WIDTH = 2.2               # метры, реальная ширина поля
 FIELD_HEIGHT = 2.2              # метры, реальная высота поля
 
 # Движение и скорость робота
-MAX_SPEED = 0.1                 # м/с, максимальная линейная скорость
+MAX_SPEED = 0.2                 # м/с, максимальная линейная скорость
 GOAL_TOLERANCE = 0.1           # метры, радиус достижения целевой траектории
 WP_THRESHOLD_M = 0.1           # м до waypoint'а — переключаемся на следующий
 
@@ -120,7 +137,7 @@ aruco_params.adaptiveThreshConstant = 7
 aruco_params.minMarkerPerimeterRate = 0.03
 aruco_params.maxMarkerPerimeterRate = 4.0
 aruco_params.polygonalApproxAccuracyRate = 0.03
-aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
 
 # ================================================================
 #  РАЗДЕЛ 4: ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -167,12 +184,15 @@ def load_calibration():
         return False
 
 ##########################
-# Безопасная отправка скоростей (подавление всех исключений)
 def safe_send(vx, vy, omega):
-    try:
-        send_velocity(float(vx), float(vy), float(omega))
-    except:
-        pass
+    def _send():
+        try:
+            send_velocity(float(vx), float(vy), float(omega))
+        except Exception:
+            pass
+    
+    # Запускаем отправку в фоновом потоке, чтобы не блокировать главный цикл
+    threading.Thread(target=_send, daemon=True).start()
 
 # Обработчик мыши
 def mouse_callback(event, x, y, flags, param):
@@ -190,7 +210,28 @@ def mouse_callback(event, x, y, flags, param):
                     calib_points = []
                     static_binary_mask = None
                 else:
-                    # Успешная калибровка → сохраняем
+                    global remap_maps
+                    # Предварительно считаем карты для remap
+                    h_out = int(FIELD_HEIGHT * PIX_PER_METER)
+                    w_out = int(FIELD_WIDTH * PIX_PER_METER)
+                    remap_maps = cv2.convertMaps(
+                        *cv2.initUndistortRectifyMap(
+                            np.eye(3), None, None, (w_out, h_out), cv2.CV_32FC1
+                        ), cv2.CV_16SC2
+                    )
+                    # Для перспективного преобразования лучше использовать стандартный метод генерации карт:
+                    remap_maps = cv2.initUndistortRectifyMap(...) # Нет, для гомографии проще:
+                    
+                    # Правильный способ для гомографии:
+                    grid_x, grid_y = np.meshgrid(np.arange(w_out), np.arange(h_out))
+                    # Инверсная гомография (из warped в original)
+                    M_inv = np.linalg.inv(M)
+                    pts = np.float32([[grid_x.flatten(), grid_y.flatten(), np.ones_like(grid_x).flatten()]]).transpose().reshape(-1, 1, 3)
+                    src_pts = cv2.perspectiveTransform(pts, M_inv)
+                    map_x = src_pts[:,:,0].reshape(h_out, w_out).astype(np.float32)
+                    map_y = src_pts[:,:,1].reshape(h_out, w_out).astype(np.float32)
+                    remap_maps = (map_x, map_y)
+                    
                     save_calibration()
         elif M is not None:
             # Клик по warped-изображению: X пикселя -> мировая Y (вправо), Y пикселя -> мировая X (вниз)
@@ -343,14 +384,11 @@ def detect_obstacles(warped_frame, robot_pix=None, marker_corners=None, scale=1)
 
     # Собираем маски по всем заданным диапазонам
     combined_mask = np.zeros((clean.shape[0], clean.shape[1]), dtype=np.uint8)
-    for i in range(0, len(OBSTACLE_COLORS)):
-        lower = OBSTACLE_COLORS[i]
-        upper = OBSTACLE_COLORS[i]  # для простоты нижняя и верхняя границы одинаковы
-        # Но обычно у нас кортеж из 6 чисел, поэтому:
-        if len(lower) == 6:
-            mask = cv2.inRange(hsv, np.array(lower[:3]), np.array(lower[3:6]))
-        else:
-            mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+    for color_range in OBSTACLE_COLORS:
+        # color_range содержит 6 чисел: (H_low, S_low, V_low, H_high, S_high, V_high)
+        lower = np.array(color_range[:3])
+        upper = np.array(color_range[3:])
+        mask = cv2.inRange(hsv, lower, upper)
         combined_mask = cv2.bitwise_or(combined_mask, mask)
 
     # Морфологическая очистка
@@ -384,23 +422,25 @@ def detect_obstacles(warped_frame, robot_pix=None, marker_corners=None, scale=1)
 def draw_obstacles(frame, binary_mask, expanded_mask=None):
     if binary_mask is None:
         return
-    # Контуры препятствий (красные)
-    contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for cnt in contours:
-        if cv2.contourArea(cnt) >= MIN_OBSTACLE_AREA_PX:
-            cv2.drawContours(frame, [cnt], -1, (0, 0, 255), 2)
 
-    # Если не передали готовую expanded, создадим её
+    # 1. Рисуем сами препятствия (красные) через наложение маски
+    # Создаем пустой слой того же размера
+    overlay_obs = np.zeros_like(frame)
+    overlay_obs[binary_mask > 0] = (0, 0, 255) # Красный цвет (BGR)
+    cv2.addWeighted(frame, 1.0, overlay_obs, 0.5, 0, frame) # Полупрозрачное наложение
+
+    # 2. Рисуем безопасную зону (оранжевые), если маска есть
     if expanded_mask is None:
         expand_px = int(OBSTACLE_SAFE_RADIUS_M * PIX_PER_METER)
         kernel_size = int(expand_px * 2 + 1)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
         expanded_mask = cv2.dilate(binary_mask, kernel, iterations=1)
 
-    expanded_contours, _ = cv2.findContours(expanded_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for ecnt in expanded_contours:
-        if cv2.contourArea(ecnt) >= MIN_OBSTACLE_AREA_PX:
-            cv2.drawContours(frame, [ecnt], -1, (255, 100, 0), 2)
+    overlay_safe = np.zeros_like(frame)
+    # Рисуем только ту часть safe_zone, которая НЕ является самим препятствием
+    safe_zone_only = (expanded_mask > 0) & (binary_mask == 0)
+    overlay_safe[safe_zone_only] = (255, 100, 0) # Оранжевый цвет (BGR)
+    cv2.addWeighted(frame, 1.0, overlay_safe, 0.4, 0, frame)
 
 def draw_border(frame):
     """Пунктирная граница (тёмно-серая)"""
@@ -606,132 +646,152 @@ def reconstruct_path(came_from, current):
     path.reverse()
     return path
 
-def get_neighbors(node, w, h):
-    x, y = node
+def get_neighbors(idx, w, h):
+    """Возвращает соседей для одномерного индекса."""
+    x, y = idx % w, idx // w
     neighbors = []
-    for dx, dy in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]:
+    # Соседи: (dx, dy, cost)
+    for dx, dy, cost in [(-1,0,1),(1,0,1),(0,-1,1),(0,1,1),(-1,-1,1.414),(-1,1,1.414),(1,-1,1.414),(1,1,1.414)]:
         nx, ny = x + dx, y + dy
         if 0 <= nx < w and 0 <= ny < h:
-            neighbors.append(((nx, ny), math.hypot(dx, dy)))
+            neighbors.append((ny * w + nx, cost)) # Возвращаем 1D индекс
     return neighbors
 
 def astar_search(small_mask, start, goal):
-    w, h = small_mask.shape[::-1]
-    open_set = [(0, start)]
+    h, w = small_mask.shape
+    start_idx = start[1] * w + start[0]
+    goal_idx = goal[1] * w + goal[0]
+    
+    open_set = []
+    heapq.heappush(open_set, (0, start_idx))
     came_from = {}
-    g_score = {start: 0}
-    f_score = {start: math.hypot(goal[0]-start[0], goal[1]-start[1])}
+    g_score = {start_idx: 0}
+    flat_mask = small_mask.flatten()
 
     while open_set:
-        open_set.sort(key=lambda x: x[0])
-        _, current = open_set.pop(0)
-        if current == goal:
-            return reconstruct_path(came_from, current)
+        _, current = heapq.heappop(open_set)
+        
+        if current == goal_idx:
+            path_idx = reconstruct_path(came_from, current)
+            return [(idx % w, idx // w) for idx in path_idx]
 
-        for (neighbor, cost) in get_neighbors(current, w, h):
-            if small_mask[neighbor[1], neighbor[0]] != 0:
+        for neighbor_idx, cost in get_neighbors(current, w, h): # Исправлена опечатка get_neighbors_1d
+            if flat_mask[neighbor_idx] != 0:
                 continue
+                
             tentative_g = g_score[current] + cost
-            if neighbor not in g_score or tentative_g < g_score[neighbor]:
-                came_from[neighbor] = current
-                g_score[neighbor] = tentative_g
-                f_score[neighbor] = tentative_g + math.hypot(goal[0]-neighbor[0], goal[1]-neighbor[1])
-                open_set.append((f_score[neighbor], neighbor))
+            if neighbor_idx not in g_score or tentative_g < g_score[neighbor_idx]:
+                came_from[neighbor_idx] = current
+                g_score[neighbor_idx] = tentative_g
+                
+                nx, ny = neighbor_idx % w, neighbor_idx // w
+                f_score = tentative_g + math.hypot(goal[0] - nx, goal[1] - ny)
+                heapq.heappush(open_set, (f_score, neighbor_idx))
     return []
 
 def dijkstra_search(small_mask, start, goal):
-    w, h = small_mask.shape[::-1]
-    open_set = [(0, start)]
+    h, w = small_mask.shape
+    start_idx = start[1] * w + start[0]
+    goal_idx = goal[1] * w + goal[0]
+    
+    open_set = []
+    heapq.heappush(open_set, (0, start_idx))
     came_from = {}
-    g_score = {start: 0}
+    g_score = {start_idx: 0}
+    flat_mask = small_mask.flatten()
 
     while open_set:
-        open_set.sort(key=lambda x: x[0])
-        _, current = open_set.pop(0)
-        if current == goal:
-            return reconstruct_path(came_from, current)
+        _, current = heapq.heappop(open_set)
+        
+        if current == goal_idx:
+            path_idx = reconstruct_path(came_from, current)
+            return [(idx % w, idx // w) for idx in path_idx]
 
-        for (neighbor, cost) in get_neighbors(current, w, h):
-            if small_mask[neighbor[1], neighbor[0]] != 0:
+        for neighbor_idx, cost in get_neighbors(current, w, h):
+            if flat_mask[neighbor_idx] != 0:
                 continue
             tentative_g = g_score[current] + cost
-            if neighbor not in g_score or tentative_g < g_score[neighbor]:
-                came_from[neighbor] = current
-                g_score[neighbor] = tentative_g
-                open_set.append((g_score[neighbor], neighbor))
+            if neighbor_idx not in g_score or tentative_g < g_score[neighbor_idx]:
+                came_from[neighbor_idx] = current
+                g_score[neighbor_idx] = tentative_g
+                heapq.heappush(open_set, (g_score[neighbor_idx], neighbor_idx))
     return []
 
 def greedy_search(small_mask, start, goal):
-    w, h = small_mask.shape[::-1]          # w, h — размеры карты
+    h, w = small_mask.shape
+    start_idx = start[1] * w + start[0]
+    goal_idx = goal[1] * w + goal[0]
+    
     start_h = math.hypot(goal[0]-start[0], goal[1]-start[1])
-    open_set = [(start_h, start)]
+    open_set = []
+    heapq.heappush(open_set, (start_h, start_idx))
     came_from = {}
-    closed_set = set()                     # посещённые узлы
+    closed_set = set()
+    flat_mask = small_mask.flatten()
 
     while open_set:
-        open_set.sort(key=lambda x: x[0])
-        _, current = open_set.pop(0)
-        if current == goal:
-            return reconstruct_path(came_from, current)
+        _, current = heapq.heappop(open_set)
+        
+        if current == goal_idx:
+            path_idx = reconstruct_path(came_from, current)
+            return [(idx % w, idx // w) for idx in path_idx]
+            
         if current in closed_set:
             continue
         closed_set.add(current)
 
-        for (neighbor, _) in get_neighbors(current, w, h):
-            if small_mask[neighbor[1], neighbor[0]] != 0:
+        for neighbor_idx, _ in get_neighbors(current, w, h):
+            if flat_mask[neighbor_idx] != 0:
                 continue
-            if neighbor not in came_from and neighbor not in closed_set:
-                came_from[neighbor] = current
-                # чистая эвристика (без учёта стоимости пути)
-                priority = math.hypot(goal[0]-neighbor[0], goal[1]-neighbor[1])
-                open_set.append((priority, neighbor))
+            if neighbor_idx not in came_from and neighbor_idx not in closed_set:
+                came_from[neighbor_idx] = current
+                nx, ny = neighbor_idx % w, neighbor_idx // w
+                priority = math.hypot(goal[0]-nx, goal[1]-ny)
+                heapq.heappush(open_set, (priority, neighbor_idx))
     return []
 
 def bidirectional_search(small_mask, start, goal):
-    """Двунаправленный A*: одновременный поиск от старта и цели."""
-    w, h = small_mask.shape[::-1]
+    h, w = small_mask.shape
+    start_idx = start[1] * w + start[0]
+    goal_idx = goal[1] * w + goal[0]
 
-    # Инициализация для прямого поиска (от старта)
-    open_fwd = [(0, start)]
-    g_fwd = {start: 0}
+    open_fwd = []
+    heapq.heappush(open_fwd, (0, start_idx))
+    g_fwd = {start_idx: 0}
     parent_fwd = {}
 
-    # Инициализация для обратного поиска (от цели)
-    open_bwd = [(0, goal)]
-    g_bwd = {goal: 0}
+    open_bwd = []
+    heapq.heappush(open_bwd, (0, goal_idx))
+    g_bwd = {goal_idx: 0}
     parent_bwd = {}
 
-    # Множество встречи
     intersection = None
     best_cost = float('inf')
+    flat_mask = small_mask.flatten()
 
     while open_fwd or open_bwd:
-        # Шаг прямого поиска
         if open_fwd:
-            open_fwd.sort(key=lambda x: x[0])
-            _, current = open_fwd.pop(0)
+            _, current = heapq.heappop(open_fwd)
 
-            # Проверяем, не встретились ли мы с обратным поиском
             if current in g_bwd:
                 total_cost = g_fwd[current] + g_bwd[current]
                 if total_cost < best_cost:
                     best_cost = total_cost
                     intersection = current
 
-            for (neighbor, cost) in get_neighbors(current, w, h):
-                if small_mask[neighbor[1], neighbor[0]] != 0:
+            for neighbor_idx, cost in get_neighbors(current, w, h):
+                if flat_mask[neighbor_idx] != 0:
                     continue
                 tentative_g = g_fwd[current] + cost
-                if neighbor not in g_fwd or tentative_g < g_fwd[neighbor]:
-                    parent_fwd[neighbor] = current
-                    g_fwd[neighbor] = tentative_g
-                    priority = tentative_g + math.hypot(goal[0]-neighbor[0], goal[1]-neighbor[1])
-                    open_fwd.append((priority, neighbor))
+                if neighbor_idx not in g_fwd or tentative_g < g_fwd[neighbor_idx]:
+                    parent_fwd[neighbor_idx] = current
+                    g_fwd[neighbor_idx] = tentative_g
+                    nx, ny = neighbor_idx % w, neighbor_idx // w
+                    priority = tentative_g + math.hypot(goal[0]-nx, goal[1]-ny)
+                    heapq.heappush(open_fwd, (priority, neighbor_idx))
 
-        # Шаг обратного поиска
         if open_bwd:
-            open_bwd.sort(key=lambda x: x[0])
-            _, current = open_bwd.pop(0)
+            _, current = heapq.heappop(open_bwd)
 
             if current in g_fwd:
                 total_cost = g_fwd[current] + g_bwd[current]
@@ -739,17 +799,17 @@ def bidirectional_search(small_mask, start, goal):
                     best_cost = total_cost
                     intersection = current
 
-            for (neighbor, cost) in get_neighbors(current, w, h):
-                if small_mask[neighbor[1], neighbor[0]] != 0:
+            for neighbor_idx, cost in get_neighbors(current, w, h):
+                if flat_mask[neighbor_idx] != 0:
                     continue
                 tentative_g = g_bwd[current] + cost
-                if neighbor not in g_bwd or tentative_g < g_bwd[neighbor]:
-                    parent_bwd[neighbor] = current
-                    g_bwd[neighbor] = tentative_g
-                    priority = tentative_g + math.hypot(start[0]-neighbor[0], start[1]-neighbor[1])
-                    open_bwd.append((priority, neighbor))
+                if neighbor_idx not in g_bwd or tentative_g < g_bwd[neighbor_idx]:
+                    parent_bwd[neighbor_idx] = current
+                    g_bwd[neighbor_idx] = tentative_g
+                    nx, ny = neighbor_idx % w, neighbor_idx // w
+                    priority = tentative_g + math.hypot(start[0]-nx, start[1]-ny)
+                    heapq.heappush(open_bwd, (priority, neighbor_idx))
 
-        # Если найдена точка встречи и оставшиеся узлы имеют оценку хуже – завершаем
         if intersection is not None:
             if (not open_fwd or open_fwd[0][0] >= best_cost) and \
                (not open_bwd or open_bwd[0][0] >= best_cost):
@@ -758,12 +818,10 @@ def bidirectional_search(small_mask, start, goal):
     if intersection is None:
         return []
 
-    # Восстановление пути: от intersection к старту и к цели
     path_fwd = reconstruct_path(parent_fwd, intersection)
     path_bwd = reconstruct_path(parent_bwd, intersection)
-    # Объединяем (без дублирования точки встречи)
-    path = path_fwd[:-1] + path_bwd[::-1]
-    return path
+    path_idx = path_fwd[:-1] + path_bwd[::-1]
+    return [(idx % w, idx // w) for idx in path_idx]
 
 # Основная функция планирования
 def plan_path(expanded_mask, start_px, goal_px, plan_scale=4):
@@ -848,38 +906,38 @@ def main():
         time.sleep(3)
         return
     
-        # ------------------- Диалог загрузки калибровки -------------------
+    # ------------------- Диалог загрузки калибровки -------------------
     if os.path.exists(CALIB_FILE):
-        # Показываем чёрный кадр с вопросом
-        dialog_frame = np.zeros((300, 500, 3), dtype=np.uint8)
-        cv2.putText(dialog_frame, "Change field borders? (y/n)", (20, 150),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        dialog_frame = np.zeros((200, 800, 3), dtype=np.uint8)
+        cv2.putText(dialog_frame, "Press 'y' to recalibrate,", (20, 80),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(dialog_frame, "any other key to load.", (20, 140),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         cv2.imshow("Calibration Dialog", dialog_frame)
-        key = -1
-        while key not in [ord('y'), ord('n'), 27]:  # 27 = Escape
-            key = cv2.waitKey(100) & 0xFF
+        key = cv2.waitKey(0) & 0xFF   # ждём нажатия бесконечно
         cv2.destroyWindow("Calibration Dialog")
-        if key == ord('n'):
-            if load_calibration():
-                # Калибровка загружена – M уже не None
-                pass
-            else:
-                print("Не удалось загрузить калибровку. Переход к ручной расстановке.")
-                M = None
-                calib_points = []
-        else:
-            # Пользователь хочет изменить – сбрасываем старую калибровку
+
+        # 'y' (латинская) или 'н' (русская в UTF-8) → сброс
+        if key == ord('y') or key == ord('н'):
             M = None
             calib_points = []
             static_binary_mask = None
-            # Удалим старый файл, чтобы не загружался снова
             try:
                 os.remove(CALIB_FILE)
             except:
                 pass
+        else:
+            # любая другая клавиша → загрузить
+            if not load_calibration():
+                print("Не удалось загрузить калибровку. Переход к ручной расстановке.")
+                M = None
+                calib_points = []
 
     # Создаём окно с возможностью изменения размера
     cv2.namedWindow("Robotino Control", cv2.WINDOW_NORMAL)
+    # Задаем размер окна один раз при инициализации
+    warp_size = (int(FIELD_WIDTH * PIX_PER_METER), int(FIELD_HEIGHT * PIX_PER_METER))
+    cv2.resizeWindow("Robotino Control", warp_size[0], warp_size[1])
     cv2.setMouseCallback("Robotino Control", mouse_callback)
     
     while True:
@@ -1065,17 +1123,40 @@ def main():
 
         # Отрисовка запланированного пути
         if planned_path and len(planned_path) > 1:
-            pts = [(int(p[0]), int(p[1])) for p in planned_path]  # planned_path уже в пикселях полного разрешения
+            pts = [(int(p[0]), int(p[1])) for p in planned_path]
             for i in range(1, len(pts)):
                 cv2.line(working_frame, pts[i-1], pts[i], (255, 0, 0), 2)  # красный путь
-            # Текущий waypoint
-            if CONTROL and robot_pos is not None and planned_path and 'tx' in locals() and 'ty' in locals():
-                px_target = int(ty * PIX_PER_METER)   # мировая Y → пиксельная X
-                py_target = int(tx * PIX_PER_METER)   # мировая X → пиксельная Y
+                
+            # --- ВЫБОР ЦЕЛЕВОЙ ТОЧКИ (waypoint) для отрисовки и управления ---
+            tx, ty = target_world[0], target_world[1] # По умолчанию цель - финальная точка
+            target_is_goal = True  # Флаг: целимся в финальную точку или в промежуточный waypoint
+            if CONTROL and robot_pos is not None:
+                wx, wy, _ = robot_pos
+                gx, gy = target_world
+                lookahead_m = WP_THRESHOLD_M
+                
+                found = False
+                for i in range(last_wp_index, len(planned_path)):
+                    wp = planned_path[i]
+                    wpx = wp[1] / PIX_PER_METER
+                    wpy = wp[0] / PIX_PER_METER
+                    if math.hypot(wpx - wx, wpy - wy) >= lookahead_m:
+                        tx, ty = wpx, wpy
+                        last_wp_index = i
+                        found = True
+                        # Если это последний waypoint, то это финальная цель
+                        target_is_goal = (i == len(planned_path) - 1)
+                        break
+                if not found:
+                    tx, ty = gx, gy
+                    target_is_goal = True
+            # ------------------------------------------------------------------
+
+            # Отрисовка текущего waypoint
+            if CONTROL and robot_pos is not None:
+                px_target = int(ty * PIX_PER_METER)   # мировая Y -> пиксельная X
+                py_target = int(tx * PIX_PER_METER)   # мировая X -> пиксельная Y
                 cv2.circle(working_frame, (px_target, py_target), 6, (255, 255, 0), -1)
-        
-        if M is not None and warp_size != (0, 0):
-            cv2.resizeWindow("Robotino Control", working_frame.shape[0], working_frame.shape[1])
             
         # Отображение одометрии на кадре
         if odom_text:
@@ -1138,8 +1219,8 @@ def main():
                             dy = escape_wy - wy
                             dist_escape = math.hypot(dx, dy)
                             if dist_escape > 0:
-                                vx_world = (dx / dist_escape) * MAX_SPEED * 0.5
-                                vy_world = (dy / dist_escape) * MAX_SPEED * 0.5
+                                vx_world = (dx / dist_escape) * MAX_SPEED * 0.75
+                                vy_world = (dy / dist_escape) * MAX_SPEED * 0.75
                                 if time.time() - last_send_time > SEND_INTERVAL:
                                     safe_send(vx_world, vy_world, 0.0)
                                     last_send_time = time.time()
@@ -1162,8 +1243,8 @@ def main():
                             plot_saved = True
                         last_send_time = time.time()
                 else:
-                    # Если путь не построен (траектория пуста) – робот стоит
-                    if not planned_path:
+                    # Если путь не построен или слишком короткий – робот стоит
+                    if not planned_path or len(planned_path) < 2:
                         current_vx_world = 0.0
                         current_vy_world = 0.0
                         if time.time() - last_send_time > SEND_INTERVAL:
@@ -1171,32 +1252,13 @@ def main():
                             last_send_time = time.time()
                         continue   # пропускаем всю дальнейшую логику до следующего кадра
 
-                    # ---------- ВЫБОР ЦЕЛЕВОЙ ТОЧКИ (заглядываем вперёд) ----------
-                    lookahead_m = WP_THRESHOLD_M
-                    tx, ty = gx, gy            # финальная цель по умолчанию
-                    target_is_goal = True
-
-                    # Ищем точку впереди, начиная с last_wp_index, чтобы не возвращаться
-                    found = False
-                    for i in range(last_wp_index, len(planned_path)):
-                        wp = planned_path[i]
-                        wpx = wp[1] / PIX_PER_METER
-                        wpy = wp[0] / PIX_PER_METER
-                        if math.hypot(wpx - wx, wpy - wy) >= lookahead_m:
-                            tx, ty = wpx, wpy
-                            target_is_goal = (i == len(planned_path) - 1)
-                            last_wp_index = i
-                            found = True
-                            break
-                    if not found:
-                        # Если не нашли — остаёмся на финальной цели
-                        tx, ty = gx, gy
-                        target_is_goal = True
-
                     # Вычисляем вектор до выбранной точки
                     dx = tx - wx
                     dy = ty - wy
                     dist_to_target = math.hypot(dx, dy)
+
+                    # Зона начала плавного торможения (например, двойной радиус цели)
+                    BRAKE_DISTANCE = GOAL_TOLERANCE * 2.0
 
                     # Остановка только у финальной цели
                     if target_is_goal and dist_to_target < GOAL_TOLERANCE:
@@ -1208,11 +1270,15 @@ def main():
                     else:
                         # Направление к цели
                         if dist_to_target > 0:
-                            # Торможение только перед самой финальной целью
-                            if target_is_goal and dist_to_target < GOAL_TOLERANCE :
-                                speed = MAX_SPEED * (dist_to_target / (GOAL_TOLERANCE))
+                            # Плавное торможение при приближении к финальной цели
+                            if target_is_goal and dist_to_target < BRAKE_DISTANCE:
+                                # Линейно уменьшаем скорость от MAX_SPEED до минимального порога
+                                speed = MAX_SPEED * (dist_to_target / BRAKE_DISTANCE)
+                                # Защита от слишком малой скорости, чтобы робот не "застрял" из-за трения
+                                speed = max(speed, 0.01) 
                             else:
                                 speed = MAX_SPEED
+                                
                             vx_world = (dx / dist_to_target) * speed
                             vy_world = (dy / dist_to_target) * speed
                         else:
